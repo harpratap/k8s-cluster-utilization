@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -29,20 +30,11 @@ func (c *Client) requestsAndUsageSumPerNamespace(ctx context.Context, nsUtil *ns
 		return err
 	}
 	for _, p := range podList.Items {
-		skip := false
-		// skip if either CPU or Memory request is not defined in ANY container
-		for _, con := range p.Spec.Containers {
-			skip = con.Resources.Requests.Cpu().IsZero() || skip
-			skip = con.Resources.Requests.Memory().IsZero() || skip
-		}
-		if skip {
-			continue
-		}
 		for _, con := range p.Spec.Containers {
 			nsUtil.RequestCPU = nsUtil.RequestCPU + con.Resources.Requests.Cpu().AsApproximateFloat64()
 			nsUtil.RequestMemory = nsUtil.RequestMemory + con.Resources.Requests.Memory().AsApproximateFloat64()
 		}
-		err = c.usageSumPerNamespace(ctx, nsUtil, p.Name)
+		err = c.usageSumPerNamespace(ctx, nsUtil, &p, skipBestEffort)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error fetching usage: %s", err.Error())
 			continue
@@ -51,14 +43,43 @@ func (c *Client) requestsAndUsageSumPerNamespace(ctx context.Context, nsUtil *ns
 	return nil
 }
 
-func (c *Client) usageSumPerNamespace(ctx context.Context, nsUtil *nsResourceUtilization, podName string) error {
-	podMetrics, err := c.metricsClientSet.MetricsV1beta1().PodMetricses(nsUtil.Namespace).Get(ctx, podName, metav1.GetOptions{})
+func isContainerCpuRequestZero(containerName string, pod *v1.Pod) bool {
+	for _, c := range pod.Spec.Containers {
+		if containerName != c.Name {
+			continue
+		}
+		return c.Resources.Requests.Cpu().IsZero()
+	}
+	return true
+}
+
+func isContainerMemoryRequestZero(containerName string, pod *v1.Pod) bool {
+	for _, c := range pod.Spec.Containers {
+		if containerName != c.Name {
+			continue
+		}
+		return c.Resources.Requests.Memory().IsZero()
+	}
+	return true
+}
+
+func (c *Client) usageSumPerNamespace(ctx context.Context, nsUtil *nsResourceUtilization, pod *v1.Pod, skipBestEffort bool) error {
+	podMetrics, err := c.metricsClientSet.MetricsV1beta1().PodMetricses(nsUtil.Namespace).Get(ctx, pod.Name, metav1.GetOptions{})
 	if err != nil {
 		return err
 	}
+	// SkipBestEffort will not add usage for containers
+	// that do not specify requests. This will prevent
+	// skewing the calculations in case you have too many containers
+	// without any requests but they do not require reserving
+	// node resources for scheduling
 	for _, c := range podMetrics.Containers {
-		nsUtil.UsedCPU = nsUtil.UsedCPU + c.Usage.Cpu().AsApproximateFloat64()
-		nsUtil.UsedMemory = nsUtil.UsedMemory + c.Usage.Memory().AsApproximateFloat64()
+		if !(isContainerCpuRequestZero(c.Name, pod) && skipBestEffort) {
+			nsUtil.UsedCPU = nsUtil.UsedCPU + c.Usage.Cpu().AsApproximateFloat64()
+		}
+		if !(isContainerMemoryRequestZero(c.Name, pod) && skipBestEffort) {
+			nsUtil.UsedMemory = nsUtil.UsedMemory + c.Usage.Memory().AsApproximateFloat64()
+		}
 	}
 	return nil
 }
